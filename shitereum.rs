@@ -75,6 +75,21 @@ impl App {
         }
         true
     }
+
+    fn is_chain_valid(&self, chain: &[Block]) -> bool {
+        for i in 0..chain.len(){
+            if i == 0 {
+                continue;
+            }
+            let first   = chain.get(i - 1).expect("has to exist");
+            let second  = chain.get(i).expect("has to exist");
+            if !self.is_block_valid(second, first){
+                return false
+            }
+        }
+        true
+    }
 }
+
 
 

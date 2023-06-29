@@ -1,15 +1,30 @@
-use sha2::Sha256;
-use sha2::Digest;
-use chrono::Utc;
-use serde::Serialize;
-use serde::Deserialize;
-use log::error;
-use log::warn;
-use log::info;
-// use p2p::*;
+use chrono::prelude::*;
+use libp2p::{
+    core::upgrade,
+    futures::StreamExt,
+    mplex,
+    noise::{Keypair, NoiseConfig, X25519Spec},
+    swarm::{Swarm, SwarmBuilder},
+    tcp::TokioTcpConfig,
+    Transport,
+};
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+use tokio::{
+    io::{stdin, AsyncBufReadExt, BufReader},
+    select, spawn,
+    sync::mpsc,
+    time::sleep,
+};
+
+const DIFFICULTY_PREFIX: &str = "00";
+
+mod p2p;
 
 pub struct App {
-    pub blocks: Vec,
+    pub blocks: Vec<Block>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -22,7 +37,56 @@ pub struct Block {
     pub nonce           : u64,
 }
 
-const DIFFICULTY_PREFIX: &str = "00";
+impl Block {
+    pub fn new (id: u64, previous_hash: String, data: String) -> Self {
+        let now = Utc::now();
+        let (nonce, hash) = mine_block(id, now.timestamp(), &previous_hash, &data);
+        Self {
+            id,
+            hash,
+            timestamp: now.timestamp(),
+            previous_hash,
+            data,
+            nonce,
+        }
+    }
+}
+
+fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str, nonce: u64) -> Vec<u8>{
+    let data = serde_json::json!({
+        "id": id,
+        "previous_hash": previous_hash,
+        "data": data,
+        "timestamp": timestamp,
+        "nonce": nonce
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(data.to_string().as_bytes());
+    hasher.finalize().as_slice().to_owned()
+}
+
+fn mine_block(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> (u64, String){
+    info!("mining block...");
+    let mut nonce = 0;
+
+    loop{
+        if nonce % 100000 == 0 {
+            info!("nonce: {}", nonce);
+        }
+        let hash = calculate_hash(id, timestamp, previous_hash, data, nonce);
+        let binary_hash = hash_to_binary_representation(&hash);
+        if binary_hash.starts_with(DIFFICULTY_PREFIX) {
+            info!(
+                "mined! nonce: {}, hash: {}, binary hash: {}",
+                nonce,
+                hex::encode(&hash),
+                binary_hash 
+            );
+            return (nonce, hex::encode(hash));
+        }
+        nonce += 1;
+    }
+}
 
 fn hash_to_binary_representation(hash: &[u8]) -> String {
     let mut res: String = String::default();
@@ -100,7 +164,7 @@ impl App {
         true
     }
 
-    fn choice_chain(&mut self, local: Vec, remote: Vec) -> Vec {
+    fn chose_chain(&mut self, local: Vec<Block>, remote: Vec<Block>) -> Vec<Block> {
         let is_local_valid = self.is_chain_valid(&local);
         let is_remote_valid = self.is_chain_valid(&remote);
         if is_local_valid && is_remote_valid {
@@ -118,56 +182,6 @@ impl App {
 }
 
 
-impl Block {
-    pub fn new (id: u64, previous_hash: String, data: String) -> Self {
-        let now = Utc::now();
-        let (nonce, hash) = mine_block(id, now.timestamp(), &previous_hash, &data);
-        Self {
-            id,
-            hash,
-            timestamp: now.timestamp(),
-            previous_hash,
-            data,
-            nonce,
-        }
-    }
-}
-
-fn mine_block(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> (u64, String){
-    info!("mining block...");
-    let mut nonce = 0;
-
-    loop{
-        if nonce % 100000 == 0 {
-            info!("nonce: {}", nonce);
-        }
-        let hash = calculate_hash(id, timestamp, previous_hash, data, nonce);
-        let binary_hash = hash_to_binary_representation(&hash);
-        if binary_hash.starts_with(DIFFICULTY_PREFIX) {
-            info!(
-                "mined! nonce: {}, hash: {}, binary hash: {}",
-                nonce,
-                hash,
-                binary_hash 
-            );
-            return (nonce, hex::encode(hash));
-        }
-        nonce += 1;
-    }
-}
-
-fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str, nonce: u64) -> Vec<u8>{
-    let data = serde_json::json!({
-        "id": id,
-        "previous_hash": previous_hash,
-        "data": data,
-        "timestamp": timestamp,
-        "nonce": nonce
-    });
-    let mut hasher = Sha256::new();
-    hasher.update(data.to_string().as_bytes());
-    hasher.finalize().as_slice().to_owned();
-}
 
 
 #[tokio::main]
@@ -178,7 +192,7 @@ async fn main (){
     let (response_sender, mut response_rcv) = mpsc::unbounded_channel();
     let (init_sender, mut init_rcv) = mpsc::unbounded_channel();
 
-    let auth_keys = Keypair::::new()
+    let auth_keys = Keypair::<X25519Spec>::new()
         .into_authentic(&p2p::KEYS)
         .expect("can create auth keys");
 
@@ -192,7 +206,7 @@ async fn main (){
 
     let mut swarm = SwarmBuilder::new(transp, behaviour, *p2p::PEER_ID)
         .executor(Box::new(|fut| {
-            spawm(fut);
+            spawn(fut);
         }))
         .build();
 
@@ -227,75 +241,42 @@ async fn main (){
                     None
                 }
             }
-        }
-    };
-
-    if let Some(event) = evt {
-        match event {
-            p2p::EventType::Init => {
-                let peers = p2p::get_list_peers(&swarm);
-                swarm.behaviour_mut().app.genesis();
-                info!("connect nodes {}", peers.len());
-                if !peers.is_empty(){
-                    let req = p2p::LocalChainRequest {
-                        from_peer_id: peers
-                            .iter()
-                            .last()
-                            .expect("at least one peer")
-                            .to_string(),
-                    };
-                    
-                    let json = serde_json::to_string(&req).expect("can jsonfy request");
+        };
+        if let Some(event) = evt {
+            match event {
+                p2p::EventType::Init => {
+                    let peers = p2p::get_list_peers(&swarm);
+                    swarm.behaviour_mut().app.genesis();
+                    info!("connect nodes {}", peers.len());
+                    if !peers.is_empty(){
+                        let req = p2p::LocalChainRequest {
+                            from_peer_id: peers
+                                .iter()
+                                .last()
+                                .expect("at least one peer")
+                                .to_string(),
+                            };
+                        let json = serde_json::to_string(&req).expect("can jsonfy request");
+                        swarm
+                            .behaviour_mut()
+                            .floodsub
+                            .publish(p2p::CHAIN_TOPIC.clone(), json.as_bytes());
+                    }
+                }
+                p2p::EventType::LocalChainResponse(resp) => {
+                    let json = serde_json::to_string(&resp).expect("can jsonfy response");
                     swarm
                         .behaviour_mut()
-                        .floodsub()
+                        .floodsub
                         .publish(p2p::CHAIN_TOPIC.clone(), json.as_bytes());
                 }
+                p2p::EventType::Input(line) => match line.as_str(){
+                    "ls p" => p2p::handle_print_peers(&swarm),
+                    cmd if cmd.starts_with("ls c") => p2p::handle_print_chain(&swarm),
+                    cmd if cmd.starts_with("create b") => p2p::handle_create_block(cmd, &mut swarm),
+                    _ => error!("unknown command"),
+                    },
+                }
             }
-            p2p::EventType::Input(line) => match line.as_str(){
-                "ls p" => p2p::handle_print_peers(&swarm),
-                cmd if cmd.starts_with("ls c") => p2p::handle_print_chain(&swarm),
-                cmd if cmd.starts_with("create b") => p2p::handle_create_block(cmd, &mut swarm),
-                _ => error!("unknown command"),
-            },
         }
     }
-
-    pub fn get_list_peers(swarm: &Swarm) -> Vec {
-        info!("Discovered Peers: ");
-        let nodes = swarm.behaviours(mdns.dicovered_nodes());
-        let mut unique_peers = HashSet::new();
-        for peer in nodes {
-            unique_peers.insert(peer);
-        }
-        unique_peers.iter().map(|p| p.to_string()).collect()
-    }
-    
-    pub fn handle_print_peers(swarm: &Swarm){
-        let peers = get_list_peers(swarm);
-        peers.iter().for_each(|p| info!("{}", p));
-    }
-
-    pub fn handle_create_block(cmd: &str, swarm: &mut Swarm) {
-        if let Some(data) = cmd.strip_prefix("create b"){
-            let behaviour = swarm.behaviour_mut();
-            let latest_block = behaviour
-                .app
-                .blocks
-                .last()
-                .expect("there is at least one block");
-            let block = block::new(
-                latest_block.id + 1,
-                latest_block.hash.clone(),
-                data.to_owned(),
-            );
-            let json = serde_json::to_string(&Block).expect("can jsonfy request");
-            behaviour.app.blocks.push(block);
-            info!("broadcasting new block");
-            behaviour
-                .floodsub
-                .publish(BLOCK_TOPIC.clone().json.as_bytes());
-        }
-    }
-
-}
